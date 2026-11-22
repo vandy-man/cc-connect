@@ -1116,8 +1116,8 @@ app_secret = "your-feishu-app-secret"
 #                           # Agent 处理期间的临时表情（默认 "OnIt"），结束后移除；设为 "none" 可禁用
 # done_emoji = "none"       # Emoji reaction when agent finishes a reply (e.g. "Done"); set to "none" to disable
 #                           # Agent 完成回复后添加的表情回复（如 "Done"）；设为 "none" 可禁用
-# group_reply_all = false   # If true, respond to ALL group messages without requiring @mention
-#                           # 设为 true 时，群聊中无需 @机器人 也会响应所有消息（默认 false）
+# group_reply_all = false   # If true, respond to ALL group messages without requiring @mention (recommended true for topic groups)
+#                           # 设为 true 时，群聊/话题群中无需 @机器人 也会响应所有消息（话题群建议设为 true）
 # skip_when_mention_others = false # If true, with group_reply_all or group_reply_all_chats enabled, ignore messages that @ others but not this bot
 #                                  # 设为 true 且开启 group_reply_all 或 group_reply_all_chats 时，@其他人但未 @本机器人 的消息不会触发
 # group_reply_all_chats = "oc_group_a,oc_group_b" # Only these groups bypass @mention; a non-empty list overrides group_reply_all / require_mention
@@ -1128,8 +1128,8 @@ app_secret = "your-feishu-app-secret"
 #                           # 接收未 @ 的群消息需要申请并发布 im:message.group_msg 权限
 # share_session_in_channel = false  # If true, all users in a group share one agent session
 #                                   # 设为 true 时，群聊内所有用户共享同一个 Agent 会话
-# thread_isolation = false  # If true, group messages use Feishu reply threads as session boundaries (one thread/root = one agent session and, in multi-workspace mode, one workspace binding)
-#                           # 设为 true 时，群聊按飞书话题/根消息隔离会话；multi-workspace 模式下每个话题也独立绑定 workspace
+# thread_isolation = false  # If true, topic groups (话题群) isolate agent sessions per topic (one topic = one agent session, replies always stay in the topic); regular groups keep per-user sessions
+#                           # 设为 true 时，话题群按话题隔离会话（一个话题 = 一个 Agent 会话，回复留在话题内）；普通群不受影响，仍按用户隔离会话
 # Share non-mentioned group messages as context with the next bot-triggered turn.
 # Messages themselves do not trigger a reply.
 # group_chat_history_share = false

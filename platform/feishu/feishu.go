@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1801,15 +1802,16 @@ func isGroupHistoryMessageType(msgType string) bool {
 }
 
 // groupHistoryScope deliberately differs from makeSessionKey. With
-// thread_isolation enabled, a main-channel mention creates a root-scoped
-// agent session, but later main-channel messages must remain in the chat-level
-// history rather than being attached to that forked session.
+// thread_isolation enabled, a topic gets a root-scoped agent session, but
+// regular-group history stays chat-level rather than being attached to a
+// per-thread session. Topic detection mirrors makeSessionKey: thread_id, not
+// chat_type (which stays "group" for topic groups).
 func (p *Platform) groupHistoryScope(msg *larkim.EventMessage, chatID string) string {
 	if chatID == "" {
 		return ""
 	}
-	if p.threadIsolation && msg != nil && stringValue(msg.ChatType) == "group" {
-		if rootID := stringValue(msg.RootId); rootID != "" {
+	if p.threadIsolation && msg != nil && isTopicMessage(msg) {
+		if rootID := topicRootMessageID(msg); rootID != "" {
 			return "thread:" + chatID + ":" + rootID
 		}
 	}
@@ -2096,8 +2098,9 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// after the chat-level allow list has admitted the chat. Do this before the
 	// existing mention filter and before allow_from: the chat controls whether
 	// cc-connect may observe the conversation, while allow_from controls who may
-	// trigger an agent turn.
-	if p.groupChatHistoryShare && chatType == "group" && !groupReplyAllForChat && botOpenID != "" &&
+	// trigger an agent turn. Topic-group messages are scoped per topic by
+	// groupHistoryScope.
+	if p.groupChatHistoryShare && isGroupChat(chatType) && !groupReplyAllForChat && botOpenID != "" &&
 		!botMentioned && !atEveryone && isGroupHistoryMessageType(msgType) {
 		if !core.AllowList(p.allowChat, chatID) {
 			slog.Debug(p.tag()+": group history ignored for unauthorized chat", "chat_id", chatID)
@@ -2117,7 +2120,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// the filter is degraded we fail closed (drop the message) and
 	// emit a periodic warning, instead of failing open.
 	stageAttachmentOnly := false
-	if chatType == "group" && !groupReplyAllForChat && filterActive {
+	if isGroupChat(chatType) && !groupReplyAllForChat && filterActive {
 		if !botMentioned {
 			switch {
 			// Feishu @all sends {"text":"@_all"} with 0 mentions.
@@ -2160,11 +2163,11 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// same event. An entry must stay silent for chats it does not own;
 	// replying "unauthorized" there would duplicate the answer of the entry
 	// that does own the chat.
-	if chatType == "group" && !core.AllowList(p.allowChat, chatID) {
+	if isGroupChat(chatType) && !core.AllowList(p.allowChat, chatID) {
 		slog.Debug(p.tag()+": message from unauthorized chat", "chat_id", chatID)
 		return nil
 	}
-	if chatType != "group" && p.groupOnly {
+	if !isGroupChat(chatType) && p.groupOnly {
 		slog.Debug(p.tag()+": p2p message skipped (group_only=true)", "chat_type", chatType)
 		return nil
 	}
@@ -2176,7 +2179,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 		// overheard via group_reply_all are dropped silently — replying to
 		// every unauthorized group member would flood the chat, and the
 		// unauthorized-chat branch above is silent for the same reason.
-		if chatType != "group" || isBotMentioned(msg.Mentions, p.getBotOpenID()) {
+		if !isGroupChat(chatType) || isBotMentioned(msg.Mentions, p.getBotOpenID()) {
 			p.replyUnauthorizedAccess(ctx, replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey})
 		}
 		return nil
@@ -2200,8 +2203,8 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 		return nil
 	}
 	var staged []stagedAttachment
-	if p.attachmentWaitMentionEnabled() && chatType == "group" && botMentioned &&
-		p.threadIsolation && isThreadSessionKey(sessionKey) {
+	if p.attachmentWaitMentionEnabled() && isGroupChat(chatType) && botMentioned &&
+		p.threadIsolation && sessionKey != "" {
 		switch cmd := p.mentionedCommand(msgType, content, mentions); {
 		case cmd == "/new":
 			p.clearStagedAttachments(sessionKey, userID)
@@ -2212,7 +2215,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 
 	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
 	var groupHistoryCtx groupHistoryContext
-	if p.groupChatHistoryShare && chatType == "group" && !groupReplyAllForChat && botOpenID != "" && (botMentioned || atEveryone) {
+	if p.groupChatHistoryShare && isGroupChat(chatType) && !groupReplyAllForChat && botOpenID != "" && (botMentioned || atEveryone) {
 		scope := p.groupHistoryScope(msg, chatID)
 		if p.isGroupHistoryNewCommand(msgType, content, mentions) {
 			p.resetGroupHistory(scope)
@@ -2223,7 +2226,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	slog.Debug(p.tag()+": routed inbound message",
 		"message_id", messageID,
 		"session_key", sessionKey,
-		"reply_in_thread", p.shouldReplyInThread(rctx),
+		"topic_session", isTopicSessionKey(sessionKey),
 	)
 
 	// Mark this thread as bot-engaged so subsequent attachment-only messages
@@ -4020,7 +4023,14 @@ func (p *Platform) SendFile(ctx context.Context, rctx any, file core.FileAttachm
 	}
 
 	msgType := detectFeishuFileMessageType(fileType)
-	fileContent, err := buildFeishuFileMessageContent(msgType, *uploadResp.Data.FileKey)
+	var fileContent string
+	var err error
+	if msgType == larkim.MsgTypeMedia {
+		fileContent, err = p.buildVideoMediaContent(ctx, *uploadResp.Data.FileKey, file.Data,
+			strings.TrimPrefix(filepath.Ext(fileName), "."))
+	} else {
+		fileContent, err = buildFeishuFileMessageContent(msgType, *uploadResp.Data.FileKey)
+	}
 	if err != nil {
 		return fmt.Errorf("%s: build file message: %w", p.tag(), err)
 	}
@@ -4607,12 +4617,14 @@ func isAttachmentMsgType(msgType string) bool {
 	return false
 }
 
-// markThreadSessionActive records that a thread sessionKey has been engaged
-// by an @bot message, enabling attachment-only follow-ups inside the thread.
-// It reports whether this call activated the thread for the first time. It is
-// a no-op when thread isolation is disabled or sessionKey is not a thread key.
+// markThreadSessionActive records that a session has been engaged by an @bot
+// message, enabling attachment-only follow-ups in that session. With the
+// topic-group session layout, the key is a root-scoped topic key in topic
+// groups and a per-user key in regular groups — both are trackable, so any
+// non-empty key is accepted. It reports whether this call activated the
+// session for the first time, and is a no-op when thread isolation is off.
 func (p *Platform) markThreadSessionActive(sessionKey string) bool {
-	if !p.threadIsolation || !isThreadSessionKey(sessionKey) {
+	if !p.threadIsolation || sessionKey == "" {
 		return false
 	}
 	_, loaded := p.activeThreadSessions.LoadOrStore(sessionKey, time.Now())
@@ -4622,12 +4634,12 @@ func (p *Platform) markThreadSessionActive(sessionKey string) bool {
 	return !loaded
 }
 
-// isActiveThreadSession reports whether the given sessionKey corresponds to a
-// thread that has previously been engaged by an @bot message. With
-// attachment_wait = "mention" the engagement expires after attachment_wait_secs
-// without an @bot message; otherwise it lasts for the process lifetime.
+// isActiveThreadSession reports whether the given sessionKey has previously
+// been engaged by an @bot message. With attachment_wait = "mention" the
+// engagement expires after attachment_wait_secs without an @bot message;
+// otherwise it lasts for the process lifetime.
 func (p *Platform) isActiveThreadSession(sessionKey string) bool {
-	if !p.threadIsolation || !isThreadSessionKey(sessionKey) {
+	if !p.threadIsolation || sessionKey == "" {
 		return false
 	}
 	v, ok := p.activeThreadSessions.Load(sessionKey)
@@ -4664,15 +4676,40 @@ func stripMentions(text string, mentions []*larkim.MentionEvent, botOpenID strin
 	return strings.TrimSpace(text)
 }
 
-// TODO: Session-key derivation and reply-thread behavior are split across multiple code paths here.
-// Should revisit thread/root handling without changing thread_isolation=false behavior.
+// isGroupChat reports whether the chat_type value denotes a multi-user chat,
+// covering both regular groups ("group") and Feishu topic groups ("topic_group").
+func isGroupChat(chatType string) bool {
+	return chatType == "group" || chatType == "topic_group"
+}
+
+// isTopicMessage reports whether the message lives inside a Feishu topic.
+// Feishu events never mark topic groups via chat_type (it stays "group");
+// the reliable signal is thread_id, set on every message inside a topic,
+// including the topic's root message.
+func isTopicMessage(msg *larkim.EventMessage) bool {
+	return stringValue(msg.ThreadId) != ""
+}
+
+// topicRootMessageID returns the message id that identifies a topic's reply
+// chain: RootId on in-topic replies, and the message's own id on the topic
+// root message itself (its MessageId is what replies' RootId points at).
+// ThreadId must NOT be used here: ReconstructReplyCtx feeds this id back to
+// the Reply API, which only accepts message ids (om_...), not topic ids
+// (omt_...).
+func topicRootMessageID(msg *larkim.EventMessage) string {
+	if rootID := stringValue(msg.RootId); rootID != "" {
+		return rootID
+	}
+	return stringValue(msg.MessageId)
+}
+
+// makeSessionKey derives the agent session key. Root-style keys ("...:root:<id>")
+// are produced exclusively for Feishu topic messages when thread_isolation is
+// on: one topic = one isolated agent session. All other chats fall through to
+// the channel/user keys.
 func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID string) string {
-	if p.threadIsolation && msg != nil && stringValue(msg.ChatType) == "group" {
-		rootID := stringValue(msg.RootId)
-		if rootID == "" {
-			rootID = stringValue(msg.MessageId)
-		}
-		if rootID != "" {
+	if p.threadIsolation && msg != nil && isTopicMessage(msg) {
+		if rootID := topicRootMessageID(msg); rootID != "" {
 			return fmt.Sprintf("%s:%s:root:%s", p.tag(), chatID, rootID)
 		}
 	}
@@ -4773,10 +4810,15 @@ func (p *Platform) shouldReplyInThread(rc replyContext) bool {
 	return p.threadIsolation && isThreadSessionKey(rc.sessionKey)
 }
 
-// shouldUseThreadOrReplyAPI is true when we should call Im.Message.Reply (optionally with ReplyInThread).
+// shouldUseThreadOrReplyAPI is true when we should call Im.Message.Reply
+// instead of creating a new chat-level message. Topic-group sessions must
+// always use the Reply API: a chat-level Create would land outside the topic.
 func (p *Platform) shouldUseThreadOrReplyAPI(rc replyContext) bool {
 	if rc.messageID == "" {
 		return false
+	}
+	if isTopicSessionKey(rc.sessionKey) {
+		return true
 	}
 	return !p.noReplyToTrigger
 }
@@ -4788,14 +4830,14 @@ func (p *Platform) sendNewMessageToChat(ctx context.Context, rc replyContext, ms
 	return p.createMessage(ctx, rc.chatID, rc.receiveIDType, msgType, content, "send")
 }
 
+// buildReplyMessageReqBody never sets ReplyInThread: in regular groups it
+// would fork a new topic, and in topic groups replying to a message inside
+// the topic already keeps the reply in place.
 func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content string) *larkim.ReplyMessageReqBody {
-	body := larkim.NewReplyMessageReqBodyBuilder().
+	return larkim.NewReplyMessageReqBodyBuilder().
 		MsgType(msgType).
-		Content(content)
-	if p.shouldReplyInThread(rc) {
-		body.ReplyInThread(true)
-	}
-	return body.Build()
+		Content(content).
+		Build()
 }
 
 func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) error {
@@ -5269,15 +5311,21 @@ func isThreadSessionKey(sessionKey string) bool {
 	return ok
 }
 
+// isTopicSessionKey reports whether the session key was derived from a topic
+// inside a Feishu topic group. After the topic-group change these are the only
+// keys carrying a root:/thread: tail.
+func isTopicSessionKey(sessionKey string) bool {
+	return isThreadSessionKey(sessionKey)
+}
+
 // ChannelKeyFromSessionKey implements core.ChannelScopedSessionKey.
 //
-// With thread_isolation enabled, makeSessionKey (feishu.go:4099) encodes an
-// isolated thread — a topic, or a group-chat thread — as
-// "feishu:<chatID>:root:<rootID>", while workspace bindings are keyed
-// "feishu:<chatID>:topic:<rootID>" (populateWorkspaceChannelKeys,
-// feishu.go:1270). Core's generic parse keeps only the chat ID, which would
-// collapse every thread in a chat onto one binding, so the layout is declared
-// here instead of being hardcoded in core.
+// With thread_isolation enabled, makeSessionKey encodes an isolated topic
+// inside a Feishu topic group as "feishu:<chatID>:root:<rootID>", while
+// workspace bindings are keyed "feishu:<chatID>:topic:<rootID>"
+// (populateWorkspaceChannelKeys). Core's generic parse keeps only the chat
+// ID, which would collapse every topic in a chat onto one binding, so the
+// layout is declared here instead of being hardcoded in core.
 //
 // The returned value omits the platform name; core prepends it.
 func (p *Platform) ChannelKeyFromSessionKey(sessionKey string) (string, bool) {
@@ -6384,13 +6432,28 @@ func (p *Platform) SendVideo(ctx context.Context, rctx any, video []byte, format
 
 	slog.Debug(p.tag()+": video uploaded", "file_key", fileKey, "format", format, "size", len(video))
 
-	mediaMsg := larkim.MessageMedia{FileKey: fileKey}
-	mediaContent, err := mediaMsg.String()
+	mediaContent, err := p.buildVideoMediaContent(ctx, fileKey, video, format)
 	if err != nil {
 		return fmt.Errorf("%s: build video message: %w", p.tag(), err)
 	}
 
 	return p.sendMediaMessage(ctx, rc, larkim.MsgTypeMedia, mediaContent)
+}
+
+// buildVideoMediaContent builds Feishu media message content for a video,
+// attaching a first-frame cover as image_key so the client renders a preview
+// thumbnail. Cover failures are non-fatal: the video is sent with a bare
+// file_key (no thumbnail) instead of failing the whole send.
+func (p *Platform) buildVideoMediaContent(ctx context.Context, fileKey string, video []byte, srcExt string) (string, error) {
+	mediaMsg := larkim.MessageMedia{FileKey: fileKey}
+	if cover, err := core.ExtractVideoCover(ctx, video, srcExt); err != nil {
+		slog.Warn(p.tag()+": extract video cover failed; sending video without thumbnail", "error", err)
+	} else if imageKey, err := p.uploadImageKey(ctx, cover); err != nil {
+		slog.Warn(p.tag()+": upload video cover failed; sending video without thumbnail", "error", err)
+	} else {
+		mediaMsg.ImageKey = imageKey
+	}
+	return mediaMsg.String()
 }
 
 type postElement struct {

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -726,6 +728,7 @@ func TestLark_ThreadIsolationUsesRootSessionKey(t *testing.T) {
 
 	messageID := "om_reply"
 	rootID := "om_root"
+	threadID := "omt_t"
 	chatID := "oc_test"
 	openID := "ou_test"
 	msgType := "text"
@@ -752,6 +755,7 @@ func TestLark_ThreadIsolationUsesRootSessionKey(t *testing.T) {
 			Message: &larkim.EventMessage{
 				MessageId:   &messageID,
 				RootId:      &rootID,
+				ThreadId:    &threadID,
 				ChatId:      &chatID,
 				ChatType:    &chatType,
 				MessageType: &msgType,
@@ -793,6 +797,7 @@ func TestLark_GroupReplyAllWithThreadIsolationUsesRootSessionKeyWithoutMention(t
 	ip := p.(*interactivePlatform)
 
 	messageID := "om_root"
+	threadID := "omt_t"
 	chatID := "oc_test"
 	openID := "ou_test"
 	msgType := "text"
@@ -814,6 +819,7 @@ func TestLark_GroupReplyAllWithThreadIsolationUsesRootSessionKeyWithoutMention(t
 			},
 			Message: &larkim.EventMessage{
 				MessageId:   &messageID,
+				ThreadId:    &threadID,
 				ChatId:      &chatID,
 				ChatType:    &chatType,
 				MessageType: &msgType,
@@ -851,30 +857,26 @@ func TestLark_GroupReplyAllWithThreadIsolationUsesRootSessionKeyWithoutMention(t
 	}
 }
 
-func TestBuildReplyMessageReqBody_SetsReplyInThreadFlag(t *testing.T) {
+func TestBuildReplyMessageReqBody_NeverSetsReplyInThread(t *testing.T) {
 	tests := []struct {
-		name          string
-		platform      *Platform
-		replyCtx      replyContext
-		wantThreading bool
+		name     string
+		platform *Platform
+		replyCtx replyContext
 	}{
 		{
-			name:          "thread isolation enabled",
-			platform:      &Platform{threadIsolation: true},
-			replyCtx:      replyContext{messageID: "om_reply", sessionKey: "feishu:oc_chat:root:om_root"},
-			wantThreading: true,
+			name:     "topic session",
+			platform: &Platform{threadIsolation: true},
+			replyCtx: replyContext{messageID: "om_reply", sessionKey: "feishu:oc_chat:root:om_root"},
 		},
 		{
-			name:          "thread isolation does not affect p2p session",
-			platform:      &Platform{threadIsolation: true},
-			replyCtx:      replyContext{messageID: "om_reply", sessionKey: "feishu:oc_chat:ou_user"},
-			wantThreading: false,
+			name:     "thread isolation does not affect p2p session",
+			platform: &Platform{threadIsolation: true},
+			replyCtx: replyContext{messageID: "om_reply", sessionKey: "feishu:oc_chat:ou_user"},
 		},
 		{
-			name:          "plain reply remains non-threaded",
-			platform:      &Platform{},
-			replyCtx:      replyContext{messageID: "om_reply"},
-			wantThreading: false,
+			name:     "plain reply",
+			platform: &Platform{},
+			replyCtx: replyContext{messageID: "om_reply"},
 		},
 	}
 
@@ -884,16 +886,240 @@ func TestBuildReplyMessageReqBody_SetsReplyInThreadFlag(t *testing.T) {
 			if body == nil {
 				t.Fatal("Body = nil, want populated reply body")
 			}
-			if body.ReplyInThread == nil {
-				if tt.wantThreading {
-					t.Fatal("ReplyInThread = nil, want true")
-				}
-				return
-			}
-			if got := *body.ReplyInThread; got != tt.wantThreading {
-				t.Fatalf("ReplyInThread = %v, want %v", got, tt.wantThreading)
+			if body.ReplyInThread != nil && *body.ReplyInThread {
+				t.Fatal("ReplyInThread = true, want never set: replies must stay in place and never fork topics")
 			}
 		})
+	}
+}
+
+func TestShouldUseThreadOrReplyAPI_TopicSessionOverridesNoReplyToTrigger(t *testing.T) {
+	tests := []struct {
+		name          string
+		platform      *Platform
+		replyCtx      replyContext
+		wantReplyAPIs bool
+	}{
+		{
+			name:          "regular chat default",
+			platform:      &Platform{},
+			replyCtx:      replyContext{messageID: "om_m", sessionKey: "feishu:oc_chat:ou_user"},
+			wantReplyAPIs: true,
+		},
+		{
+			name:          "regular chat with reply_to_trigger=false",
+			platform:      &Platform{noReplyToTrigger: true},
+			replyCtx:      replyContext{messageID: "om_m", sessionKey: "feishu:oc_chat:ou_user"},
+			wantReplyAPIs: false,
+		},
+		{
+			name:          "topic session overrides reply_to_trigger=false",
+			platform:      &Platform{noReplyToTrigger: true},
+			replyCtx:      replyContext{messageID: "om_m", sessionKey: "feishu:oc_chat:root:om_root"},
+			wantReplyAPIs: true,
+		},
+		{
+			name:          "topic session without message id cannot reply",
+			platform:      &Platform{noReplyToTrigger: true},
+			replyCtx:      replyContext{sessionKey: "feishu:oc_chat:root:om_root"},
+			wantReplyAPIs: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.platform.shouldUseThreadOrReplyAPI(tt.replyCtx); got != tt.wantReplyAPIs {
+				t.Fatalf("shouldUseThreadOrReplyAPI() = %v, want %v", got, tt.wantReplyAPIs)
+			}
+		})
+	}
+}
+
+// TestMakeSessionKey_TopicMessageKeysByRootMessageID locks the topic-session
+// keying to real Feishu event shapes: chat_type stays "group" even in topic
+// groups, topic membership is signalled by thread_id, and the key id is the
+// topic's root message id (om_..., never the omt_... topic id — the Reply API
+// only accepts message ids). Regression: the topic root message and in-topic
+// replies must derive the SAME key, or one topic splits into two sessions.
+func TestMakeSessionKey_TopicMessageKeysByRootMessageID(t *testing.T) {
+	strPtr := func(s string) *string { return &s }
+
+	cases := []struct {
+		name            string
+		threadIsolation bool
+		msg             *larkim.EventMessage
+		wantKey         string
+	}{
+		{
+			name:            "topic root message keys by own message id",
+			threadIsolation: true,
+			msg:             &larkim.EventMessage{ChatType: strPtr("group"), ThreadId: strPtr("omt_t"), MessageId: strPtr("om_root")},
+			wantKey:         "feishu:oc_c:root:om_root",
+		},
+		{
+			name:            "topic reply keys by root id, same key as topic root",
+			threadIsolation: true,
+			msg:             &larkim.EventMessage{ChatType: strPtr("group"), ThreadId: strPtr("omt_t"), RootId: strPtr("om_root"), ParentId: strPtr("om_root"), MessageId: strPtr("om_m")},
+			wantKey:         "feishu:oc_c:root:om_root",
+		},
+		{
+			name:            "regular group message without thread stays per-user",
+			threadIsolation: true,
+			msg:             &larkim.EventMessage{ChatType: strPtr("group"), MessageId: strPtr("om_m")},
+			wantKey:         "feishu:oc_c:ou_u",
+		},
+		{
+			name:            "regular group quote reply (no thread id) stays per-user",
+			threadIsolation: true,
+			msg:             &larkim.EventMessage{ChatType: strPtr("group"), ParentId: strPtr("om_root"), MessageId: strPtr("om_m")},
+			wantKey:         "feishu:oc_c:ou_u",
+		},
+		{
+			name:            "p2p message with no thread stays per-user",
+			threadIsolation: true,
+			msg:             &larkim.EventMessage{ChatType: strPtr("p2p"), MessageId: strPtr("om_m")},
+			wantKey:         "feishu:oc_c:ou_u",
+		},
+		{
+			name:            "topic message without isolation falls back to per-user",
+			threadIsolation: false,
+			msg:             &larkim.EventMessage{ChatType: strPtr("group"), ThreadId: strPtr("omt_t"), RootId: strPtr("om_root")},
+			wantKey:         "feishu:oc_c:ou_u",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &Platform{platformName: "feishu", threadIsolation: tc.threadIsolation}
+			if got := p.makeSessionKey(tc.msg, "oc_c", "ou_u"); got != tc.wantKey {
+				t.Fatalf("makeSessionKey() = %q, want %q", got, tc.wantKey)
+			}
+		})
+	}
+}
+
+func TestGroupHistoryScope_TopicScopesByRootMessageID(t *testing.T) {
+	p := &Platform{platformName: "feishu", threadIsolation: true}
+	strPtr := func(s string) *string { return &s }
+
+	if got := p.groupHistoryScope(&larkim.EventMessage{ChatType: strPtr("group"), ThreadId: strPtr("omt_t"), MessageId: strPtr("om_root")}, "oc_c"); got != "thread:oc_c:om_root" {
+		t.Fatalf("scope = %q, want thread:oc_c:om_root for topic root message", got)
+	}
+	if got := p.groupHistoryScope(&larkim.EventMessage{ChatType: strPtr("group"), ThreadId: strPtr("omt_t"), RootId: strPtr("om_root")}, "oc_c"); got != "thread:oc_c:om_root" {
+		t.Fatalf("scope = %q, want thread:oc_c:om_root for topic reply (same scope as root)", got)
+	}
+	if got := p.groupHistoryScope(&larkim.EventMessage{ChatType: strPtr("group"), RootId: strPtr("om_root")}, "oc_c"); got != "chat:oc_c" {
+		t.Fatalf("scope = %q, want chat:oc_c for regular group without thread", got)
+	}
+}
+
+func TestOnMessage_TopicGroupReplyWithoutMentionIsAnswered(t *testing.T) {
+	p, err := newPlatform("lark", lark.LarkBaseUrl, map[string]any{
+		"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true,
+		"group_reply_all": true, "thread_isolation": true,
+	})
+	if err != nil {
+		t.Fatalf("newPlatform(lark) error = %v", err)
+	}
+	ip := p.(*interactivePlatform)
+	ip.botOpenID = "ou_bot"
+
+	messageID := "om_reply_inside_topic"
+	rootID := "om_topic_root"
+	threadID := "omt_t"
+	chatID := "oc_test"
+	openID := "ou_test"
+	msgType := "text"
+	chatType := "group"
+	senderType := "user"
+	content := `{"text":"reply inside topic, no mention"}`
+	createText := strconv.FormatInt(time.Now().UnixMilli(), 10)
+
+	msgCh := make(chan *core.Message, 1)
+	ip.handler = func(_ core.Platform, msg *core.Message) { msgCh <- msg }
+
+	if err := ip.onMessage(context.Background(), &larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Sender: &larkim.EventSender{
+				SenderId:   &larkim.UserId{OpenId: &openID},
+				SenderType: &senderType,
+			},
+			Message: &larkim.EventMessage{
+				MessageId:   &messageID,
+				RootId:      &rootID,
+				ThreadId:    &threadID,
+				ChatId:      &chatID,
+				ChatType:    &chatType,
+				MessageType: &msgType,
+				Content:     &content,
+				CreateTime:  &createText,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("onMessage() error = %v", err)
+	}
+
+	select {
+	case receivedMsg := <-msgCh:
+		if receivedMsg.SessionKey != "lark:oc_test:root:om_topic_root" {
+			t.Fatalf("SessionKey = %q, want lark:oc_test:root:om_topic_root", receivedMsg.SessionKey)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected topic-group reply without mention to be handled under group_reply_all")
+	}
+}
+
+func TestSendCard_TopicSessionNeverCreatesMessage(t *testing.T) {
+	var replyHits, createHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success", "expire": 7200, "tenant_access_token": "tenant-token",
+			})
+		case strings.HasSuffix(r.URL.Path, "/reply"):
+			replyHits++
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success",
+				"data": map[string]any{"message_id": "om_sent"},
+			})
+		case r.URL.Path == "/open-apis/im/v1/messages":
+			createHits++
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success",
+				"data": map[string]any{"message_id": "om_sent"},
+			})
+		default:
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success", "data": map[string]any{}})
+		}
+	}))
+	defer srv.Close()
+
+	const appID = "cli_card_topic"
+	const appSecret = "secret-card-topic"
+	ip := &interactivePlatform{Platform: &Platform{
+		platformName:     "feishu",
+		domain:           srv.URL,
+		appID:            appID,
+		appSecret:        appSecret,
+		noReplyToTrigger: true,
+		client: lark.NewClient(appID, appSecret,
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+	}}
+
+	card := core.NewCard().ButtonsEqual(core.DefaultBtn("ok", "callback:x")).Build()
+	rc := replyContext{messageID: "om_trigger", chatID: "oc_chat", sessionKey: "feishu:oc_chat:root:om_root"}
+	if err := ip.SendCard(context.Background(), rc, card); err != nil {
+		t.Fatalf("SendCard() error = %v", err)
+	}
+	if createHits != 0 {
+		t.Fatalf("chat-level create called %d times, want 0: topic cards must stay inside the topic", createHits)
+	}
+	if replyHits != 1 {
+		t.Fatalf("reply API called %d times, want 1", replyHits)
 	}
 }
 

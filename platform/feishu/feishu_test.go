@@ -378,7 +378,7 @@ func TestOnMessageThreadIsolationBootstrapsExistingThreadContext(t *testing.T) {
 		},
 	}
 
-	chatType := "group"
+	chatType := "topic_group"
 	senderType := "user"
 	msgType := "text"
 	content := `{"text":"@_user_1 看看这个"}`
@@ -1528,13 +1528,16 @@ func TestMarkAndIsActiveThreadSession(t *testing.T) {
 		}
 	})
 
-	t.Run("non-thread sessionKey is ignored", func(t *testing.T) {
+	t.Run("per-user regular-group sessionKey is trackable", func(t *testing.T) {
 		p := &Platform{threadIsolation: true}
-		if p.markThreadSessionActive(directKey) {
-			t.Fatal("non-thread session must not report activation")
-		}
 		if p.isActiveThreadSession(directKey) {
-			t.Fatal("expected non-thread sessionKey to be ignored")
+			t.Fatal("per-user session should not be active before mark")
+		}
+		if !p.markThreadSessionActive(directKey) {
+			t.Fatal("per-user regular-group session must report activation")
+		}
+		if !p.isActiveThreadSession(directKey) {
+			t.Fatal("per-user session should be active after mark")
 		}
 	})
 
@@ -1631,6 +1634,9 @@ func TestOnMessageThreadIsolationAdmitsAttachmentWithoutMention(t *testing.T) {
 				},
 				Message: &larkim.EventMessage{
 					MessageId:   stringPtr(msgID),
+					// Real events keep chat_type "group" even in topic groups;
+					// thread_id is what marks topic membership.
+					ThreadId:    stringPtr("omt_thread"),
 					ChatId:      stringPtr(chatID),
 					ChatType:    &chatType,
 					MessageType: stringPtr(msgType),

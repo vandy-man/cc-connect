@@ -36,7 +36,14 @@ func newGroupHistoryTestPlatform(handler core.MessageHandler) *Platform {
 
 func makeGroupHistoryEvent(t *testing.T, messageID, userID, msgType, rawContent, chatID, rootID string, mentioned bool) *larkim.P2MessageReceiveV1 {
 	t.Helper()
+	// Root-scoped (thread) history only exists for topic messages; regular
+	// groups keep chat-level history. Real events keep chat_type "group" in
+	// both cases — thread_id is what marks topic membership.
 	chatType := "group"
+	threadID := ""
+	if rootID != "" {
+		threadID = "omt_" + rootID
+	}
 	senderType := "user"
 	content := rawContent
 	mentions := []*larkim.MentionEvent(nil)
@@ -74,6 +81,7 @@ func makeGroupHistoryEvent(t *testing.T, messageID, userID, msgType, rawContent,
 			Message: &larkim.EventMessage{
 				MessageId:   stringPtr(messageID),
 				RootId:      optionalString(rootID),
+				ThreadId:    optionalString(threadID),
 				ChatId:      stringPtr(chatID),
 				ChatType:    &chatType,
 				MessageType: stringPtr(msgType),

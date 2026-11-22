@@ -44,7 +44,10 @@ func (p *interactivePlatform) SendCard(ctx context.Context, rctx any, card *core
 		return fmt.Errorf("%s: chatID is empty, cannot send card", p.tag())
 	}
 
-	if !p.noReplyToTrigger && p.shouldReplyInThread(rc) {
+	// Topic sessions must never fall through to createMessage — a chat-level
+	// send escapes the topic. Regular chats follow the same reply routing as
+	// plain text messages.
+	if p.shouldUseThreadOrReplyAPI(rc) {
 		return p.ReplyCard(ctx, rctx, card)
 	}
 
